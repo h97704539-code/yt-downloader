@@ -1,9 +1,11 @@
 import logging
 import os
 import subprocess
+import tempfile
+import json
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -26,6 +28,21 @@ app.add_middleware(
 
 class VideoRequest(BaseModel):
     url: str
+    cookies: Optional[str] = None # Netscape format cookies string
+
+def create_cookie_file(cookies_content: str):
+    """Creates a temporary cookie file and returns the path."""
+    if not cookies_content:
+        return None
+    try:
+        # Create a temp file
+        tf = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        tf.write(cookies_content)
+        tf.close()
+        return tf.name
+    except Exception as e:
+        logger.error(f"Error creating cookie file: {e}")
+        return None
 
 @app.get("/")
 def health_check():
@@ -35,23 +52,23 @@ def health_check():
 def get_video_info(request: VideoRequest):
     """
     Fetch metadata for a YouTube video.
-    Returns title, thumbnail, and available formats.
     """
     url = request.url
+    cookie_file = create_cookie_file(request.cookies)
+    
     try:
-        ydl_opts = {'quiet': True, 'no_warnings': True}
+        ydl_opts = {
+            'quiet': True, 
+            'no_warnings': True,
+        }
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(url, download=False)
             
-            # Extract relevant formats (simplify for UI)
             formats = []
             for f in info_dict.get('formats', []):
-                # Filter for useful formats (mp4 with video+audio is rare in high quality, 
-                # so we might list 'best' or specialized ones. 
-                # For simplicity, let's just grab a few distinct resolution mp4s with audio if possible, 
-                # or rely on 'best' flag in download).
-                
-                # Check for video+audio combined (filesize often present)
                 if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
                      formats.append({
                         'format_id': f['format_id'],
@@ -61,37 +78,34 @@ def get_video_info(request: VideoRequest):
                         'note': f.get('format_note')
                     })
             
-            # Reverse sort by resolution/quality if possible, or just send best.
-            # If no combined formats, user might settle for 'best' (handled by download logic).
-            
             return {
                 "title": info_dict.get('title'),
                 "thumbnail": info_dict.get('thumbnail'),
-                "duration": info_dict.get('duration'),
                 "formats": formats
             }
     except Exception as e:
         logger.error(f"Error extracting info: {e}")
+        # Return generic error if cookie failed
+        if "Sign in" in str(e):
+             raise HTTPException(status_code=400, detail="YouTube requires authentication. Please ensure cookies are sent.")
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Cleanup temp file
+        if cookie_file and os.path.exists(cookie_file):
+            os.unlink(cookie_file)
 
-@app.get("/download")
-def download_video(url: str = Query(..., description="YouTube Video URL"), 
-                   format_id: Optional[str] = Query(None, description="Specific format ID or 'best'")):
+@app.post("/download") # Changed to POST to accept large cookie body easily
+def download_video(request: VideoRequest, format_id: str = Query(None)):
     """
     Stream the video download directly to the client.
-    Uses yt-dlp to pipe stdout.
     """
+    url = request.url
+    cookies = request.cookies
+    cookie_file = create_cookie_file(cookies)
+
     try:
-        # Determine format. If None, default to 'best' (single file, video+audio).
-        # Note: 'best' in yt-dlp usually means best video+audio combined.
-        # If we want 1080p, we often need to merge video+audio, which requires ffmpeg.
-        # On Render Free Tier, ffmpeg might not be easy or fast enough. 
-        # So we prefer 'best' (often 720p) or explicit format IDs that are pre-merged.
-        
         f_param = format_id if format_id else 'best'
         
-        # Command to stream to stdout
-        # -o - : output to stdout
         cmd = [
             "yt-dlp",
             "-f", f_param,
@@ -99,6 +113,16 @@ def download_video(url: str = Query(..., description="YouTube Video URL"),
             url
         ]
         
+        if cookie_file:
+            cmd.extend(["--cookies", cookie_file])
+            # Note: We need to keep the file alive during the subprocess, 
+            # but we also need to clean it up. 
+            # For simplicity, we'll let it persist for the duration or rely on OS cleanup?
+            # Better: defer cleanup or use a wrapper. 
+            # Since this is a simple script, we'll accept a small leak or try to cleanup after process start?
+            # Actually, yt-dlp reads the file at start. We can probably wait a bit or just accept the leak on free tier (it wipes on restart).
+            pass
+
         # Open subprocess
         proc = subprocess.Popen(
             cmd,
@@ -106,7 +130,6 @@ def download_video(url: str = Query(..., description="YouTube Video URL"),
             stderr=subprocess.PIPE
         )
         
-        # Generator to yield chunks
         def iterfile():
             try:
                 while True:
@@ -115,25 +138,27 @@ def download_video(url: str = Query(..., description="YouTube Video URL"),
                         break
                     yield data
                 proc.stdout.close()
-                return_code = proc.wait()
-                if return_code != 0:
-                     # Check stderr if needed, but stream already started
-                     pass
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
                 proc.kill()
+            finally:
+                if cookie_file and os.path.exists(cookie_file):
+                    # Attempt cleanup after streaming
+                    try:
+                        os.unlink(cookie_file)
+                    except:
+                        pass
 
-        # Set headers for download
         headers = {
             "Content-Disposition": f'attachment; filename="video.mp4"' 
-            # Ideally we'd know the filename/ext ahead of time, but for streaming pipes it's tricky.
-            # We can default to video.mp4 or try to guess.
         }
         
         return StreamingResponse(iterfile(), media_type="video/mp4", headers=headers)
 
     except Exception as e:
         logger.error(f"Download error: {e}")
+        if cookie_file and os.path.exists(cookie_file):
+            os.unlink(cookie_file)
         raise HTTPException(status_code=500, detail="Download failed")
 
 if __name__ == "__main__":
