@@ -33,8 +33,10 @@ class VideoRequest(BaseModel):
 def create_cookie_file(cookies_content: str):
     """Creates a temporary cookie file and returns the path."""
     if not cookies_content:
+        logger.warning("No cookies content provided!")
         return None
     try:
+        logger.info(f"Creating cookie file with {len(cookies_content)} chars")
         # Create a temp file
         tf = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
         tf.write(cookies_content)
