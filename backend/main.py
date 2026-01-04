@@ -96,13 +96,41 @@ def get_video_info(request: VideoRequest):
         if cookie_file and os.path.exists(cookie_file):
             os.unlink(cookie_file)
 
-@app.post("/download") # Changed to POST to accept large cookie body easily
-def download_video(request: VideoRequest, format_id: str = Query(None)):
+import uuid
+
+# Memory storage for short-lived cookie tokens
+# structure: { "token": "cookie_content" }
+token_store = {}
+
+class PrepareRequest(BaseModel):
+    cookies: Optional[str] = None
+
+@app.post("/prepare_download")
+def prepare_download(request: PrepareRequest):
     """
-    Stream the video download directly to the client.
+    Store cookies temporarily and return a token.
+    Client uses this token to trigger a GET download.
     """
-    url = request.url
-    cookies = request.cookies
+    token = str(uuid.uuid4())
+    # Store cookies (or None)
+    token_store[token] = request.cookies
+    return {"token": token}
+
+@app.get("/download")
+def download_video(url: str = Query(..., description="YouTube Video URL"), 
+                   format_id: str = Query(None),
+                   token: str = Query(None)):
+    """
+    Stream the video download.
+    Uses token to retrieve cookies.
+    """
+    # Retrieve cookies from store
+    cookies = token_store.get(token)
+    
+    # Clean up token (one-time use)
+    if token and token in token_store:
+        del token_store[token]
+        
     cookie_file = create_cookie_file(cookies)
 
     try:
@@ -117,13 +145,6 @@ def download_video(request: VideoRequest, format_id: str = Query(None)):
         
         if cookie_file:
             cmd.extend(["--cookies", cookie_file])
-            # Note: We need to keep the file alive during the subprocess, 
-            # but we also need to clean it up. 
-            # For simplicity, we'll let it persist for the duration or rely on OS cleanup?
-            # Better: defer cleanup or use a wrapper. 
-            # Since this is a simple script, we'll accept a small leak or try to cleanup after process start?
-            # Actually, yt-dlp reads the file at start. We can probably wait a bit or just accept the leak on free tier (it wipes on restart).
-            pass
 
         # Open subprocess
         proc = subprocess.Popen(
@@ -145,7 +166,6 @@ def download_video(request: VideoRequest, format_id: str = Query(None)):
                 proc.kill()
             finally:
                 if cookie_file and os.path.exists(cookie_file):
-                    # Attempt cleanup after streaming
                     try:
                         os.unlink(cookie_file)
                     except:
